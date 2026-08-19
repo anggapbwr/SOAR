@@ -7,44 +7,18 @@ Built as a hands-on portfolio project to demonstrate the full data flow behind a
 ---
 
 ## Architecture
-```
-[generator.py] --POST--> [n8n: Webhook]
 
-│
+The pipeline has five stages:
 
-▼
+1. **`generator.py`** sends a randomized dummy security alert via `POST` to an n8n webhook
+2. **n8n Webhook** node receives it
+3. **n8n Code node** maps a human-readable MITRE tactic hint to a real MITRE ATT&CK technique ID
+4. **n8n If node** branches on severity:
+   - `CRITICAL` / `HIGH` → also sends a **Telegram** notification, in parallel with step 5
+   - everything else → skips straight to step 5
+5. **n8n HTTP Request** node `POST`s the enriched alert to the dashboard's `/api/alerts` endpoint, which writes it to SQLite
 
-[Code: MITRE ATT&CK mapping]
-
-│
-
-▼
-
-[If: severity == CRITICAL/HIGH?]
-
-┌────┴────┐
-
-true          false
-
-│             │
-
-[Telegram notify]     │
-
-│             │
-
-└─────┬───────┘
-
-▼
-
-[HTTP Request → POST /api/alerts]
-
-│
-
-▼
-
-[Next.js dashboard + SQLite]
-```
-Every alert — regardless of severity — is written to the dashboard. Only `CRITICAL` and `HIGH` severity alerts additionally trigger a Telegram notification, simulating a SOC's urgency-based escalation path.
+Every alert, regardless of severity, ends up on the dashboard. Only `CRITICAL`/`HIGH` alerts additionally trigger a Telegram notification — simulating a SOC's urgency-based escalation path.
 
 ---
 
@@ -65,34 +39,16 @@ Every alert — regardless of severity — is written to the dashboard. Only `CR
 ---
 
 ## Project Structure
-```
-mini-soar-dashboard/
 
-├── src/
+- `src/app/page.tsx` — main dashboard page
+- `src/app/layout.tsx` — fonts + global shell
+- `src/app/globals.css` — design tokens + radar-sweep signature animation
+- `src/app/api/alerts/` — REST endpoints (`GET` / `POST` / `PATCH`)
+- `src/components/` — `HeaderBar`, `KpiStrip`, `AlertFeed`, `DetailPanel`, `SeverityChart`
+- `src/lib/` — `db.ts` (SQLite), `types.ts` (shared types + style tokens)
+- `generator/generator.py` — dummy alert generator
+- `n8n/mini-soar-workflow.json` — exported n8n workflow, ready to import
 
-│   ├── app/
-
-│   │   ├── page.tsx              # Main dashboard page
-
-│   │   ├── layout.tsx             # Fonts + global shell
-
-│   │   ├── globals.css            # Design tokens + radar-sweep signature animation
-
-│   │   └── api/alerts/            # REST endpoints (GET / POST / PATCH)
-
-│   ├── components/                # HeaderBar, KpiStrip, AlertFeed, DetailPanel, SeverityChart
-
-│   └── lib/                       # db.ts (SQLite), types.ts (shared types + style tokens)
-
-├── generator/
-
-│   └── generator.py               # Dummy alert generator
-
-└── n8n/
-
-└── mini-soar-workflow.json    # Exported n8n workflow (see below)
-
-```
 ---
 
 ## Getting Started
@@ -101,45 +57,47 @@ mini-soar-dashboard/
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (with WSL2 backend on Windows)
 - [Node.js 22.13+](https://nodejs.org/) (LTS recommended) — ships with the built-in `node:sqlite` module used here
 - Python 3 + `pip install requests`
-- A Telegram bot token ([via @BotFather](https://t.me/BotFather)) and your chat ID
+- A Telegram bot token (via [@BotFather](https://t.me/BotFather)) and your chat ID
 
 ### 1. Run n8n
+
 ```bash
 docker volume create n8n_data
 docker run -it --rm --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n docker.n8n.io/n8nio/n8n
 ```
-Open `http://localhost:5678`, create a local account, then import `n8n/mini-soar-workflow.json` (**Import from File** in the workflow menu). Add your Telegram credentials to the "Send a text message" node, then set the workflow to **Active**.
 
-> **Docker networking note:** the workflow's HTTP Request node targets `http://host.docker.internal:3000` rather than `localhost:3000`, since n8n runs inside a container and `localhost` there refers to the container itself, not the host machine.
+Open `http://localhost:5678`, create a local account, then import `n8n/mini-soar-workflow.json` via **Import from File**. Add your Telegram credentials to the "Send a text message" node, then set the workflow to **Active**.
+
+> **Docker networking note:** the workflow's HTTP Request node targets `http://host.docker.internal:3000` rather than `localhost:3000`, since n8n runs inside a container where `localhost` refers to the container itself, not the host machine.
 
 ### 2. Run the dashboard
+
 ```bash
 cd mini-soar-dashboard
 npm install
 npm run dev
 ```
+
 Open `http://localhost:3000`. A SQLite database is created automatically at `data/alerts.db`.
 
 ### 3. Run the alert generator
+
 ```bash
 cd generator
 python generator.py
 ```
+
 Sends a randomized alert every 5–15 seconds to `http://localhost:5678/webhook/mini-soar-ingest`. Watch alerts populate the dashboard in real time, with Telegram notifications for `CRITICAL`/`HIGH` events.
 
 ---
 
 ## The n8n Workflow
 
-The exported workflow (`n8n/mini-soar-workflow.json`) has four stages:
-
-1. **Webhook** — receives the raw alert JSON from `generator.py`
-2. **Code (JavaScript)** — maps a human-readable MITRE tactic hint (e.g. `"Credential Access"`) to a real MITRE ATT&CK technique ID (e.g. `T1110.001`), and normalizes the payload
-3. **If** — branches on severity (`CRITICAL` or `HIGH` vs. everything else)
-4. **Telegram + HTTP Request** — the high-severity branch fans out to *both* a Telegram notification *and* the dashboard API in parallel; the low-severity branch goes straight to the dashboard API
+The exported workflow (`n8n/mini-soar-workflow.json`) has four stages: **Webhook** → **Code (MITRE mapping)** → **If (severity branch)** → **Telegram + HTTP Request (parallel)**.
 
 ### A bug worth mentioning (and how it was fixed)
-Early versions of this workflow chained **Telegram → HTTP Request** in sequence. That's wrong: the Telegram node's output overwrites `$json` with Telegram's own API response, so by the time execution reached HTTP Request, the alert's real data (severity, rule name, source IP, etc.) had already been replaced — the dashboard received Telegram's confirmation payload instead of the alert. The fix was to run Telegram and HTTP Request **in parallel** off the same `If` branch, rather than in series.
+
+Early versions of this workflow chained **Telegram → HTTP Request** in sequence. That's wrong: the Telegram node's output overwrites `$json` with Telegram's own API response, so by the time execution reached HTTP Request, the alert's real data (severity, rule name, source IP, etc.) had already been replaced — the dashboard received Telegram's confirmation payload instead of the alert itself. The fix was to run Telegram and HTTP Request **in parallel** off the same `If` branch, rather than in series.
 
 ---
 
@@ -172,5 +130,5 @@ Early versions of this workflow chained **Telegram → HTTP Request** in sequenc
 ---
 
 ## License
-MIT — feel free to fork and adapt for your own portfolio.
 
+MIT — feel free to fork and adapt for your own portfolio.
